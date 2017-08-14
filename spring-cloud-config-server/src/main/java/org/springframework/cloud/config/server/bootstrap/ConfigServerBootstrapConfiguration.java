@@ -29,19 +29,20 @@ import org.springframework.context.annotation.Import;
 import org.springframework.util.StringUtils;
 
 /**
- * Bootstrap configuration to fetch external configuration from a (possibly remote)
- * {@link EnvironmentRepository}. Off by default because it can delay startup, but can be
- * enabled with <code>spring.cloud.config.server.bootstrap=true</code>. This would be
- * useful, for example, if the config server were embedded in another app that wanted to
+ * Bootstrap configuration to fetch external configuration from a (possibly
+ * remote) {@link EnvironmentRepository}. Off by default because it can delay
+ * startup, but can be enabled with
+ * <code>spring.cloud.config.server.bootstrap=true</code>. This would be useful,
+ * for example, if the config server were embedded in another app that wanted to
  * be configured from the same repository as all the other clients.
  *
  * @author Dave Syer
  * @author Roy Clarkson
  */
 @Configuration
+@ConditionalOnProperty("spring.cloud.config.server.bootstrap")
 public class ConfigServerBootstrapConfiguration {
 
-	@ConditionalOnProperty("spring.cloud.config.server.bootstrap")
 	@EnableConfigurationProperties(ConfigServerProperties.class)
 	@Import(EnvironmentRepositoryConfiguration.class)
 	protected static class LocalPropertySourceLocatorConfiguration {
@@ -57,15 +58,14 @@ public class ConfigServerBootstrapConfiguration {
 
 		@Bean
 		public EnvironmentRepositoryPropertySourceLocator environmentRepositoryPropertySourceLocator() {
-			return new EnvironmentRepositoryPropertySourceLocator(this.repository,
-					this.client.getName(), this.client.getProfile(), getDefaultLabel());
+			return new EnvironmentRepositoryPropertySourceLocator(this.repository, this.client.getName(),
+					this.client.getProfile(), getDefaultLabel());
 		}
 
 		private String getDefaultLabel() {
 			if (StringUtils.hasText(this.client.getLabel())) {
 				return this.client.getLabel();
-			}
-			else if (StringUtils.hasText(this.server.getDefaultLabel())) {
+			} else if (StringUtils.hasText(this.server.getDefaultLabel())) {
 				return this.server.getDefaultLabel();
 			}
 			return null;

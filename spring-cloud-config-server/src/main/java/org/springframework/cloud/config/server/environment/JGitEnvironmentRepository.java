@@ -16,6 +16,8 @@
 
 package org.springframework.cloud.config.server.environment;
 
+import static org.springframework.util.StringUtils.hasText;
+
 import java.io.File;
 import java.io.IOException;
 import java.util.HashSet;
@@ -36,8 +38,10 @@ import org.eclipse.jgit.api.ResetCommand.ResetType;
 import org.eclipse.jgit.api.Status;
 import org.eclipse.jgit.api.StatusCommand;
 import org.eclipse.jgit.api.TransportCommand;
+import org.eclipse.jgit.api.TransportConfigCallback;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.api.errors.RefNotFoundException;
+import org.eclipse.jgit.errors.NoRemoteRepositoryException;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.transport.CredentialsProvider;
 import org.eclipse.jgit.transport.FetchResult;
@@ -55,8 +59,6 @@ import org.springframework.util.Assert;
 import org.springframework.util.StringUtils;
 
 import com.jcraft.jsch.Session;
-
-import static org.springframework.util.StringUtils.hasText;
 
 /**
  * An {@link EnvironmentRepository} backed by a single git repository.
@@ -79,8 +81,6 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 	 */
 	private int timeout = 5;
 
-	private boolean initialized;
-
 	/**
 	 * Flag to indicate that the repository should be cloned on startup (not on demand).
 	 * Generally leads to slower startup but faster first query.
@@ -90,17 +90,23 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 	private JGitEnvironmentRepository.JGitFactory gitFactory = new JGitEnvironmentRepository.JGitFactory();
 
 	private String defaultLabel = DEFAULT_LABEL;
-	
+
 	/**
 	 * The credentials provider to use to connect to the Git repository.
 	 */
 	private CredentialsProvider gitCredentialsProvider;
 
 	/**
+	 * Transport configuration callback for JGit commands.
+	 */
+	private TransportConfigCallback transportConfigCallback;
+
+	/**
 	 * Flag to indicate that the repository should force pull. If true discard any local
 	 * changes and take from remote repository.
 	 */
 	private boolean forcePull;
+	private boolean initialized;
 
 	public JGitEnvironmentRepository(ConfigurableEnvironment environment) {
 		super(environment);
@@ -120,6 +126,15 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 
 	public void setTimeout(int timeout) {
 		this.timeout = timeout;
+	}
+
+	public TransportConfigCallback getTransportConfigCallback() {
+		return transportConfigCallback;
+	}
+
+	public void setTransportConfigCallback(
+			TransportConfigCallback transportConfigCallback) {
+		this.transportConfigCallback = transportConfigCallback;
 	}
 
 	public JGitFactory getGitFactory() {
@@ -170,37 +185,42 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 	/**
 	 * Get the working directory ready.
 	 */
-	private String refresh(String label) {
-		initialize();
+	public String refresh(String label) {
 		Git git = null;
 		try {
 			git = createGitClient();
 			if (shouldPull(git)) {
 				fetch(git, label);
-				//checkout after fetch so we can get any new branches, tags, ect.
+				// checkout after fetch so we can get any new branches, tags,
+				// ect.
 				checkout(git, label);
-				if(isBranch(git, label)) {
-					//merge results from fetch
+				if (isBranch(git, label)) {
+					// merge results from fetch
 					merge(git, label);
 					if (!isClean(git)) {
-						logger.warn("The local repository is dirty. Resetting it to origin/"
-								+ label + ".");
+						logger.warn(
+								"The local repository is dirty. Resetting it to origin/"
+										+ label + ".");
 						resetHard(git, label, "refs/remotes/origin/" + label);
 					}
 				}
 			}
-			else{
-				//nothing to update so just checkout
+			else {
+				// nothing to update so just checkout
 				checkout(git, label);
 			}
-			//always return what is currently HEAD as the version
-			return git.getRepository().getRef("HEAD").getObjectId().getName();
+			// always return what is currently HEAD as the version
+			return git.getRepository().findRef("HEAD").getObjectId().getName();
 		}
 		catch (RefNotFoundException e) {
-			throw new NoSuchLabelException("No such label: " + label);
+			throw new NoSuchLabelException("No such label: " + label, e);
+		}
+		catch (NoRemoteRepositoryException e) {
+			throw new NoSuchRepositoryException("No such repository: " + getUri(), e);
 		}
 		catch (GitAPIException e) {
-			throw new IllegalStateException("Cannot clone or checkout repository", e);
+			throw new NoSuchRepositoryException(
+					"Cannot clone or checkout repository: " + getUri(), e);
 		}
 		catch (Exception e) {
 			throw new IllegalStateException("Cannot load environment", e);
@@ -219,6 +239,7 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 
 	/**
 	 * Clones the remote repository and then opens a connection to it.
+	 * 
 	 * @throws GitAPIException
 	 * @throws IOException
 	 */
@@ -249,8 +270,7 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 		return checkout.call();
 	}
 
-
-	public /*public for testing*/ boolean shouldPull(Git git) throws GitAPIException {
+	protected boolean shouldPull(Git git) throws GitAPIException {
 		boolean shouldPull;
 		Status gitStatus = git.status().call();
 		boolean isWorkingTreeClean = gitStatus.isClean();
@@ -292,24 +312,25 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 		return isBranch(git, label) && !isLocalBranch(git, label);
 	}
 
-	private FetchResult fetch(Git git, String label) {
+	protected FetchResult fetch(Git git, String label) {
 		FetchCommand fetch = git.fetch();
 		fetch.setRemote("origin");
 		fetch.setTagOpt(TagOpt.FETCH_TAGS);
 
-		setTimeout(fetch);
+		configureCommand(fetch);
 		try {
-			setCredentialsProvider(fetch);
 			FetchResult result = fetch.call();
-			if(result.getTrackingRefUpdates() != null && result.getTrackingRefUpdates().size() > 0) {
-				this.logger.info("Fetched for remote " + label + " and found " + result.getTrackingRefUpdates().size()
-					+ " updates");
+			if (result.getTrackingRefUpdates() != null
+					&& result.getTrackingRefUpdates().size() > 0) {
+				logger.info("Fetched for remote " + label + " and found "
+						+ result.getTrackingRefUpdates().size() + " updates");
 			}
 			return result;
 		}
 		catch (Exception ex) {
-			this.logger.warn("Could not fetch remote for " + label + " remote: " + git
-					.getRepository().getConfig().getString("remote", "origin", "url"));
+			String message = "Could not fetch remote for " + label + " remote: " + git
+					.getRepository().getConfig().getString("remote", "origin", "url");
+			warn(message, ex);
 			return null;
 		}
 	}
@@ -317,16 +338,18 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 	private MergeResult merge(Git git, String label) {
 		try {
 			MergeCommand merge = git.merge();
-			merge.include(git.getRepository().getRef("origin/" + label));
+			merge.include(git.getRepository().findRef("origin/" + label));
 			MergeResult result = merge.call();
-			if(!result.getMergeStatus().isSuccessful()) {
-				this.logger.warn("Merged from remote " + label + " with result " + result.getMergeStatus());
+			if (!result.getMergeStatus().isSuccessful()) {
+				this.logger.warn("Merged from remote " + label + " with result "
+						+ result.getMergeStatus());
 			}
 			return result;
 		}
 		catch (Exception ex) {
-			this.logger.warn("Could not merge remote for " + label + " remote: " + git
-					.getRepository().getConfig().getString("remote", "origin", "url"));
+			String message = "Could not merge remote for " + label + " remote: " + git
+					.getRepository().getConfig().getString("remote", "origin", "url");
+			warn(message, ex);
 			return null;
 		}
 	}
@@ -337,21 +360,31 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 		reset.setMode(ResetType.HARD);
 		try {
 			Ref resetRef = reset.call();
-			if(resetRef != null) {
-				this.logger.info("Reset label " + label + " to version " + resetRef.getObjectId());
+			if (resetRef != null) {
+				this.logger.info(
+						"Reset label " + label + " to version " + resetRef.getObjectId());
 			}
 			return resetRef;
 		}
 		catch (Exception ex) {
-			this.logger.warn("Could not reset to remote for " + label + " (current ref="
+			String message = "Could not reset to remote for " + label + " (current ref="
 					+ ref + "), remote: " + git.getRepository().getConfig()
-							.getString("remote", "origin", "url"));
+							.getString("remote", "origin", "url");
+			warn(message, ex);
 			return null;
 		}
 	}
 
 	private Git createGitClient() throws IOException, GitAPIException {
-		if (new File(getBasedir(), ".git").exists()) {
+		File lock = new File(getWorkingDirectory(), ".git/index.lock");
+		if (lock.exists()) {
+			// The only way this can happen is if another JVM (e.g. one that
+			// crashed earlier) created the lock. We can attempt to recover by
+			// wiping the slate clean.
+			logger.info("Deleting stale JGit lock file at " + lock);
+			lock.delete();
+		}
+		if (new File(getWorkingDirectory(), ".git").exists()) {
 			return openGitRepository();
 		}
 		else {
@@ -359,8 +392,10 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 		}
 	}
 
-	// Synchronize here so that multiple requests don't all try and delete the base dir
-	// together (this is a once only operation, so it only holds things up on the first
+	// Synchronize here so that multiple requests don't all try and delete the
+	// base dir
+	// together (this is a once only operation, so it only holds things up on
+	// the first
 	// request).
 	private synchronized Git copyRepository() throws IOException, GitAPIException {
 		deleteBaseDirIfExists();
@@ -393,8 +428,7 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 	private Git cloneToBasedir() throws GitAPIException {
 		CloneCommand clone = this.gitFactory.getCloneCommandByCloneRepository()
 				.setURI(getUri()).setDirectory(getBasedir());
-		setTimeout(clone);
-		setCredentialsProvider(clone);
+		configureCommand(clone);
 		try {
 			return clone.call();
 		}
@@ -406,11 +440,14 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 
 	private void deleteBaseDirIfExists() {
 		if (getBasedir().exists()) {
-			try {
-				FileUtils.delete(getBasedir(), FileUtils.RECURSIVE);
-			}
-			catch (IOException e) {
-				throw new IllegalStateException("Failed to initialize base directory", e);
+			for (File file : getBasedir().listFiles()) {
+				try {
+					FileUtils.delete(file, FileUtils.RECURSIVE);
+				}
+				catch (IOException e) {
+					throw new IllegalStateException("Failed to initialize base directory",
+							e);
+				}
 			}
 		}
 	}
@@ -420,25 +457,39 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 			SshSessionFactory.setInstance(new JschConfigSessionFactory() {
 				@Override
 				protected void configure(Host hc, Session session) {
-					session.setConfig("StrictHostKeyChecking", isStrictHostKeyChecking() ? "yes" : "no");
+					session.setConfig("StrictHostKeyChecking",
+							isStrictHostKeyChecking() ? "yes" : "no");
 				}
 			});
 			this.initialized = true;
 		}
 	}
 
-	private void setCredentialsProvider(TransportCommand<?, ?> cmd) {
-		if (hasText(getUsername())) {
-			cmd.setCredentialsProvider(
-					new UsernamePasswordCredentialsProvider(getUsername(), getPassword()));
-		} else if (hasText(getPassphrase())) {
-			cmd.setCredentialsProvider(
-					new PassphraseCredentialsProvider(getPassphrase()));
+	private void configureCommand(TransportCommand<?, ?> command) {
+		command.setTimeout(this.timeout);
+		if (this.transportConfigCallback != null) {
+			command.setTransportConfigCallback(this.transportConfigCallback);
+		}
+		CredentialsProvider credentialsProvider = getCredentialsProvider();
+		if (credentialsProvider != null) {
+			command.setCredentialsProvider(credentialsProvider);
 		}
 	}
 
-	private void setTimeout(TransportCommand<?, ?> pull) {
-		pull.setTimeout(this.timeout);
+	private CredentialsProvider getCredentialsProvider() {
+		if (this.gitCredentialsProvider != null) {
+			return this.gitCredentialsProvider;
+		}
+
+		if (hasText(getUsername()) && hasText(getPassword())) {
+			return new UsernamePasswordCredentialsProvider(getUsername(), getPassword());
+		}
+
+		if (hasText(getPassphrase())) {
+			return new PassphraseCredentialsProvider(getPassphrase());
+		}
+
+		return null;
 	}
 
 	private boolean isClean(Git git) {
@@ -447,10 +498,9 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 			return status.call().isClean();
 		}
 		catch (Exception e) {
-			this.logger
-					.warn("Could not execute status command on local repository. Cause: ("
-							+ e.getClass().getSimpleName() + ") " + e.getMessage());
-
+			String message = "Could not execute status command on local repository. Cause: ("
+					+ e.getClass().getSimpleName() + ") " + e.getMessage();
+			warn(message, e);
 			return false;
 		}
 	}
@@ -482,6 +532,13 @@ public class JGitEnvironmentRepository extends AbstractScmEnvironmentRepository
 			}
 		}
 		return false;
+	}
+
+	protected void warn(String message, Exception ex) {
+		logger.warn(message);
+		if (logger.isDebugEnabled()) {
+			logger.debug("Stacktrace for: " + message, ex);
+		}
 	}
 
 	/**
