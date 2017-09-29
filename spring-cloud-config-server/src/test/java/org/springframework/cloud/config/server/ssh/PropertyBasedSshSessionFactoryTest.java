@@ -1,5 +1,5 @@
 /*
- * Copyright 2015 the original author or authors.
+ * Copyright 2015 - 2017 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,11 +15,6 @@
  */
 
 package org.springframework.cloud.config.server.ssh;
-
-import static org.mockito.Matchers.isNull;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoMoreInteractions;
-import static org.mockito.Mockito.when;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -42,6 +37,11 @@ import com.jcraft.jsch.HostKeyRepository;
 import com.jcraft.jsch.JSch;
 import com.jcraft.jsch.Session;
 import com.jcraft.jsch.UserInfo;
+
+import static org.mockito.Matchers.isNull;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.when;
 
 /**
  * Unit tests for property based SSH config processor
@@ -136,6 +136,37 @@ public class PropertyBasedSshSessionFactoryTest {
 		HostKey hostKey = captor.getValue();
 		Assert.assertEquals("gitlab.example.local", hostKey.getHost());
 		Assert.assertEquals(HOST_KEY, hostKey.getKey());
+	}
+
+	@Test
+	public void preferredAuthenticationsIsSpecified() {
+		SshUri sshKey = new SshUriProperties.SshUriPropertiesBuilder()
+				.uri("ssh://gitlab.example.local:3322/somerepo.git")
+				.privateKey(PRIVATE_KEY)
+				.preferredAuthentications("password,keyboard-interactive")
+				.build();
+		setupSessionFactory(sshKey);
+
+		factory.configure(hc, session);
+		verify(session).setConfig("PreferredAuthentications", "password,keyboard-interactive");
+		verify(session).setConfig("StrictHostKeyChecking", "no");
+		verifyNoMoreInteractions(session);
+	}
+
+	@Test
+	public void customKnownHostsFileIsUsed() throws Exception {
+		SshUri sshKey = new SshUriProperties.SshUriPropertiesBuilder()
+				.uri("git@gitlab.example.local:someorg/somerepo.git")
+				.privateKey(PRIVATE_KEY)
+				.knownHostsFile("/ssh/known_hosts")
+				.build();
+		setupSessionFactory(sshKey);
+
+		factory.createSession(hc, null, SshUriPropertyProcessor.getHostname(sshKey.getUri()), 22, null);
+		ArgumentCaptor<String> captor = ArgumentCaptor.forClass(String.class);
+
+		verify(jSch).setKnownHosts(captor.capture());
+		Assert.assertEquals("/ssh/known_hosts", captor.getValue());
 	}
 
 	private void setupSessionFactory(SshUri sshKey) {
